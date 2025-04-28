@@ -1,0 +1,39 @@
+services:
+  keyvault-api:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      # Postgres connection (Postgres service is on the same 'backend' network)
+      PG_HOST:              postgres
+      POSTGRES_DB:          ${POSTGRES_DB}
+      SECRETS_READ_USER:    ${SECRETS_READ_USER}
+      SECRETS_READ_PASSWORD: ${SECRETS_READ_PASSWORD}
+      SECRETS_WRITE_USER:   ${SECRETS_WRITE_USER}
+      SECRETS_WRITE_PASSWORD: ${SECRETS_WRITE_PASSWORD}
+      # per-service API keys
+      API_MASTER_KEY_READ:  ${API_MASTER_KEY_READ}
+      API_MASTER_KEY_WRITE: ${API_MASTER_KEY_WRITE}
+    networks:
+      - homelab
+
+  logicapp:
+    image: nodered/node-red:latest
+    container_name: keyvault-logicapp
+    ports:
+      - "1880:1880"
+    volumes:
+      - node_red_data:/data
+    environment:
+      # secure the editor/UI with admin credentials
+      - NODE_RED_USERNAME=${NODE_RED_USERNAME}
+      - NODE_RED_PASSWORD=${NODE_RED_PASSWORD}
+    networks:
+      - homelab
+
+volumes:
+  node_red_data:
+
+networks:
+  homelab:
+    external: true

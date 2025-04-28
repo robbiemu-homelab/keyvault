@@ -1,0 +1,11 @@
+get_secret: |
+  SELECT secret_value
+    FROM secrets
+   WHERE secret_key   = $1
+     AND project_key = $2
+
+upsert_secret: |
+  INSERT INTO secrets (project_key, secret_key, secret_value)
+       VALUES ($1, $2, $3)
+  ON CONFLICT (project_key, secret_key)
+    DO UPDATE SET secret_value = EXCLUDED.secret_value
