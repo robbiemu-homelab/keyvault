@@ -161,14 +161,23 @@ pub async fn upsert_secret(
   };
 
   let result = sqlx::query(query)
-    .bind(&payload.key)
-    .bind(&payload.value)
-    .bind(&project)
+    .bind(&project) // $1 → project_key
+    .bind(&payload.key) // $2 → secret_key
+    .bind(&payload.value) // $3 → secret_value
     .execute(&state.write_pool)
     .await;
 
+
+  // match result {
+  //   Ok(_) => StatusCode::NO_CONTENT.into_response(),
+  //   Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "DB error").into_response(),
+  // }
   match result {
     Ok(_) => StatusCode::NO_CONTENT.into_response(),
-    Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "DB error").into_response(),
+    Err(err) => {
+      // print the full SQLx error to stderr
+      eprintln!("[upsert_secret] SQLx error = {:?}", err);
+      (StatusCode::INTERNAL_SERVER_ERROR, "DB error").into_response()
+    }
   }
 }

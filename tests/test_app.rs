@@ -41,87 +41,158 @@ impl TestDb {
     };
     let admin_pool = PgPool::connect(&admin_url).await.unwrap();
 
-    // Create a fresh database
+    // ── ensure reader/writer roles exist ────────────────────────────────
+    admin_pool
+      .execute(
+        r#"DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='secrets_reader') THEN
+      CREATE ROLE secrets_reader;
+  END IF;
+END
+$$;"#,
+      )
+      .await
+      .unwrap();
+    admin_pool
+      .execute(
+        r#"DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='secrets_writer') THEN
+      CREATE ROLE secrets_writer;
+  END IF;
+END
+$$;"#,
+      )
+      .await
+      .unwrap();
+
+    // ── create login users and assign roles ─────────────────────────────
+    let read_user = std::env::var("SECRETS_READ_USER").unwrap();
+    let read_pwd = std::env::var("SECRETS_READ_PASSWORD").unwrap();
+    admin_pool
+      .execute(
+        format!(
+          r#"DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{0}') THEN
+      CREATE ROLE "{0}" LOGIN PASSWORD '{1}';
+  END IF;
+END
+$$;"#,
+          read_user, read_pwd
+        )
+        .as_str(),
+      )
+      .await
+      .unwrap();
+    admin_pool
+      .execute(format!("GRANT secrets_reader TO \"{}\";", read_user).as_str())
+      .await
+      .unwrap();
+
+    let write_user = std::env::var("SECRETS_WRITE_USER").unwrap();
+    let write_pwd = std::env::var("SECRETS_WRITE_PASSWORD").unwrap();
+    admin_pool
+      .execute(
+        format!(
+          r#"DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{0}') THEN
+      CREATE ROLE "{0}" LOGIN PASSWORD '{1}';
+  END IF;
+END
+$$;"#,
+          write_user, write_pwd
+        )
+        .as_str(),
+      )
+      .await
+      .unwrap();
+    admin_pool
+      .execute(format!("GRANT secrets_writer TO \"{}\";", write_user).as_str())
+      .await
+      .unwrap();
+
+    // ── create a fresh database ────────────────────────────────────────
     let name = format!("testdb_{}", Uuid::new_v4().simple());
     admin_pool
       .execute(format!("CREATE DATABASE {}", name).as_str())
       .await
       .unwrap();
 
-    // Grant CONNECT privilege on DB to vault roles
-    let read_role = std::env::var("SECRETS_READ_USER")
-      .expect("SECRETS_READ_USER must be set");
-    let write_role = std::env::var("SECRETS_WRITE_USER")
-      .expect("SECRETS_WRITE_USER must be set");
+    // ── allow roles to connect ─────────────────────────────────────────
     admin_pool
       .execute(
-        format!("GRANT CONNECT ON DATABASE {} TO {}", name, read_role).as_str(),
+        format!("GRANT CONNECT ON DATABASE {} TO secrets_reader;", name)
+          .as_str(),
       )
       .await
       .unwrap();
     admin_pool
       .execute(
-        format!("GRANT CONNECT ON DATABASE {} TO {}", name, write_role)
+        format!("GRANT CONNECT ON DATABASE {} TO secrets_writer;", name)
           .as_str(),
       )
       .await
       .unwrap();
 
-    // Build URL for test DB
+    // Build test DB URL and connect as admin
     let test_url = if admin_pwd.is_empty() {
       format!("postgres://{}@{}/{}", admin_user, host, name)
     } else {
       format!("postgres://{}:{}@{}/{}", admin_user, admin_pwd, host, name)
     };
-    let pool = PgPool::connect(&test_url).await.unwrap();
+    let test_admin = PgPool::connect(&test_url).await.unwrap();
 
-    // Create secrets table schema
-    pool
-      .execute(
-        r#"CREATE TABLE IF NOT EXISTS secrets (
-                project_key TEXT NOT NULL,
-                secret_key TEXT NOT NULL,
-                secret_value JSONB NOT NULL,
-                PRIMARY KEY (project_key, secret_key)
-            );"#,
-      )
+    // ── create schema and table ─────────────────────────────────────────
+    test_admin
+      .execute(r#"CREATE SCHEMA IF NOT EXISTS public;"#)
       .await
       .unwrap();
-
-    // Apply grants using vault roles
-    pool
+    test_admin
       .execute(
-        format!("GRANT USAGE ON SCHEMA public TO {}", read_role).as_str(),
-      )
-      .await
-      .unwrap();
-    pool
-      .execute(
-        format!("GRANT USAGE ON SCHEMA public TO {}", write_role).as_str(),
-      )
-      .await
-      .unwrap();
-    pool
-      .execute(format!("GRANT SELECT ON secrets TO {}", read_role).as_str())
-      .await
-      .unwrap();
-    pool
-      .execute(
-        format!("GRANT INSERT, UPDATE, DELETE ON secrets TO {}", write_role)
-          .as_str(),
+        r#"
+          CREATE TABLE IF NOT EXISTS secrets (
+              project_key TEXT NOT NULL,
+              secret_key TEXT NOT NULL,
+              secret_value JSONB NOT NULL,
+              PRIMARY KEY (project_key, secret_key)
+          );
+      "#,
       )
       .await
       .unwrap();
 
-    // Seed a default test secret
+    // ── grant privileges to roles ───────────────────────────────────────
+    test_admin
+      .execute(r#"GRANT USAGE ON SCHEMA public TO secrets_reader;"#)
+      .await
+      .unwrap();
+    test_admin
+      .execute(r#"GRANT USAGE ON SCHEMA public TO secrets_writer;"#)
+      .await
+      .unwrap();
+    test_admin
+      .execute(r#"GRANT SELECT ON secrets TO secrets_reader;"#)
+      .await
+      .unwrap();
+    test_admin
+      .execute(
+        r#"GRANT SELECT, INSERT, UPDATE, DELETE ON secrets TO secrets_writer;"#,
+      )
+      .await
+      .unwrap();
+
+    // ── seed initial data as admin ─────────────────────────────────────
     sqlx::query(
       "INSERT INTO secrets (project_key, secret_key, secret_value) VALUES \
        ($1, $2, $3)",
     )
     .bind("test_project")
     .bind("mykey")
-    .bind(serde_json::json!({"some": "value"}))
-    .execute(&pool)
+    .bind(serde_json::json!({"some":"value"}))
+    .execute(&test_admin)
     .await
     .unwrap();
 
@@ -181,10 +252,10 @@ async fn create_test_state() -> AppState {
   );
   queries_map.insert(
     "upsert_secret".into(),
-    "INSERT INTO secrets (secret_key, secret_value, project_key) VALUES ($1, \
-     $2, $3)
-         ON CONFLICT (project_key, secret_key) DO UPDATE SET secret_value = \
-     EXCLUDED.secret_value"
+    // match your handler: project_key first, then key, then value::jsonb
+    "INSERT INTO secrets (project_key, secret_key, secret_value) VALUES ($1, \
+     $2, $3::jsonb) ON CONFLICT (project_key, secret_key) DO UPDATE SET \
+     secret_value = EXCLUDED.secret_value"
       .into(),
   );
   let queries = Queries(queries_map);
@@ -289,4 +360,126 @@ async fn test_get_secret_not_found() {
     .await
     .unwrap();
   assert_eq!(res.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_upsert_secret_happy_path() {
+  let (app, _) = create_test_app().await;
+  let payload = r#"{"key":"newkey","value":{"foo":"bar"}}"#;
+
+  let res = app
+    .oneshot(
+      Request::builder()
+        .method("POST")
+        .uri("/secrets")
+        .header("x-api-key", "test-api-key-write")
+        .header("x-project-key", "test_project")
+        .header("content-type", "application/json")
+        .body(Body::from(payload))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+  assert_eq!(res.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn test_upsert_secret_bad_api_key() {
+  let (app, _) = create_test_app().await;
+  let payload = r#"{"key":"another","value":{"a":1}}"#;
+
+  let res = app
+    .oneshot(
+      Request::builder()
+        .method("POST")
+        .uri("/secrets")
+        .header("x-api-key", "wrong-api-key")
+        .header("x-project-key", "test_project")
+        .header("content-type", "application/json")
+        .body(Body::from(payload))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+  assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_upsert_secret_missing_project_key() {
+  let (app, _) = create_test_app().await;
+  let payload = r#"{"key":"noproj","value":{"x":42}}"#;
+
+  let res = app
+    .oneshot(
+      Request::builder()
+        .method("POST")
+        .uri("/secrets")
+        .header("x-api-key", "test-api-key-write")
+        .header("content-type", "application/json")
+        .body(Body::from(payload))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+  assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_upsert_secret_overwrite_existing() {
+  let (app, _) = create_test_app().await;
+  let app = app.clone(); // Clone the router for reuse
+
+  let payload = r#"{"key":"mykey","value":{"some":"new_value"}}"#;
+
+  // First request using the cloned router
+  let res = app
+    .clone()
+    .oneshot(
+      Request::builder()
+        .method("POST")
+        .uri("/secrets")
+        .header("x-api-key", "test-api-key-write")
+        .header("x-project-key", "test_project")
+        .header("content-type", "application/json")
+        .body(Body::from(payload))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+  assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+  // Second request using the cloned router
+  let res = app
+    .oneshot(
+      Request::builder()
+        .uri("/secrets/mykey")
+        .header("x-api-key", "test-api-key-read")
+        .header("x-project-key", "test_project")
+        .body(Body::empty())
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+  assert_eq!(res.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_upsert_secret_with_read_key_forbidden() {
+  let (app, _) = create_test_app().await;
+  let payload = r#"{"key":"anotherkey","value":{"foo":"baz"}}"#;
+
+  let res = app
+    .oneshot(
+      Request::builder()
+        .method("POST")
+        .uri("/secrets")
+        .header("x-api-key", "test-api-key-read")
+        .header("x-project-key", "test_project")
+        .header("content-type", "application/json")
+        .body(Body::from(payload))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+  assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 }
