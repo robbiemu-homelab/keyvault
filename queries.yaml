@@ -9,3 +9,14 @@ upsert_secret: |
        VALUES ($1, $2, $3::jsonb)
   ON CONFLICT (project_key, secret_key)
     DO UPDATE SET secret_value = EXCLUDED.secret_value
+
+delete_secret: |
+  DELETE FROM secrets
+   WHERE secret_key = $1
+     AND project_key = $2
+
+search_secrets: |
+  SELECT secret_key, project_key, secret_value
+    FROM secrets
+   WHERE project_key = $1
+     AND ($2::text IS NULL OR secret_key ILIKE '%' || $2 || '%')

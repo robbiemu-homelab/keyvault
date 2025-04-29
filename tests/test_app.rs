@@ -1,7 +1,10 @@
+use axum::Extension;
+use axum::body::to_bytes;
 use axum::http::{Request, StatusCode};
 use axum::{Router, body::Body};
 use dotenvy::dotenv;
 use once_cell::sync::Lazy;
+use serde_json::Value;
 use sqlx::{Executor, PgPool};
 use std::collections::HashMap;
 use tokio::runtime::Runtime;
@@ -9,7 +12,10 @@ use tokio::sync::OnceCell;
 use tower::util::ServiceExt; // for .oneshot
 use uuid::Uuid;
 
-use keyvault::{AppState, Queries, get_secret, upsert_secret};
+use keyvault::{
+  AppState, Queries, delete_secret, get_secret, search_secrets, upsert_secret,
+  upsert_secret_by_path,
+};
 
 // Single-instance ephemeral test database for the suite
 static TEST_DB: Lazy<OnceCell<TestDb>> = Lazy::new(OnceCell::const_new);
@@ -230,7 +236,36 @@ impl Drop for TestDb {
 
 /// Ensure the ephemeral database is created once per test session
 async fn test_setup() {
-  TEST_DB.get_or_init(TestDb::init).await;
+  // ensure the DB exists
+  let test_db = TEST_DB.get_or_init(TestDb::init).await;
+
+  // reconnect as admin directly into that new test DB
+  let admin_user = std::env::var("POSTGRES_USER").unwrap();
+  let admin_pwd = std::env::var("POSTGRES_PASSWORD").unwrap();
+  let host = std::env::var("PG_HOST").unwrap_or_else(|_| "localhost".into());
+
+  let test_url = if admin_pwd.is_empty() {
+    format!("postgres://{}@{}/{}", admin_user, host, test_db.name)
+  } else {
+    format!(
+      "postgres://{}:{}@{}/{}",
+      admin_user, admin_pwd, host, test_db.name
+    )
+  };
+  let test_admin = PgPool::connect(&test_url).await.unwrap();
+
+  // reset table and reseed the original secret
+  test_admin.execute("TRUNCATE TABLE secrets;").await.unwrap();
+  sqlx::query(
+    "INSERT INTO secrets (project_key, secret_key, secret_value) VALUES ($1, \
+     $2, $3)",
+  )
+  .bind("test_project")
+  .bind("mykey")
+  .bind(serde_json::json!({"some":"value"}))
+  .execute(&test_admin)
+  .await
+  .unwrap();
 }
 
 /// Build AppState pointing at the ephemeral DB
@@ -258,6 +293,21 @@ async fn create_test_state() -> AppState {
      secret_value = EXCLUDED.secret_value"
       .into(),
   );
+
+  // ─── support DELETE /secrets/:key ───────────
+  queries_map.insert(
+    "delete_secret".into(),
+    "DELETE FROM secrets WHERE secret_key = $1 AND project_key = $2".into(),
+  );
+  // ─── support POST /search ────────────────────
+  // ILIKE '%%' will match everything when term == ""
+  queries_map.insert(
+    "search_secrets".into(),
+    "SELECT secret_key, project_key, secret_value FROM secrets WHERE \
+     project_key = $1 AND secret_key ILIKE '%' || $2 || '%'"
+      .into(),
+  );
+
   let queries = Queries(queries_map);
 
   // Build read/write pools with vault roles
@@ -288,10 +338,18 @@ async fn create_test_state() -> AppState {
 /// Create test HTTP app and shared state
 async fn create_test_app() -> (Router, AppState) {
   let state = create_test_state().await;
+
   let app = Router::new()
-    .route("/secrets/{key}", axum::routing::get(get_secret))
+    .route(
+      "/secrets/{key}",
+      axum::routing::get(get_secret)
+        .put(upsert_secret_by_path)
+        .delete(delete_secret),
+    )
     .route("/secrets", axum::routing::post(upsert_secret))
-    .layer(axum::extract::Extension(state.clone()));
+    .route("/search", axum::routing::post(search_secrets))
+    .layer(Extension(state.clone()));
+
   (app, state)
 }
 
@@ -427,8 +485,6 @@ async fn test_upsert_secret_missing_project_key() {
 #[tokio::test]
 async fn test_upsert_secret_overwrite_existing() {
   let (app, _) = create_test_app().await;
-  let app = app.clone(); // Clone the router for reuse
-
   let payload = r#"{"key":"mykey","value":{"some":"new_value"}}"#;
 
   // First request using the cloned router
@@ -450,6 +506,7 @@ async fn test_upsert_secret_overwrite_existing() {
 
   // Second request using the cloned router
   let res = app
+    .clone()
     .oneshot(
       Request::builder()
         .uri("/secrets/mykey")
@@ -482,4 +539,244 @@ async fn test_upsert_secret_with_read_key_forbidden() {
     .await
     .unwrap();
   assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_put_upsert_secret_by_path_happy_path() {
+  let (app, _state) = create_test_app().await;
+  let payload = r#"{"value":{"new":"data"}}"#;
+
+  let res = app
+    .clone()
+    .oneshot(
+      Request::builder()
+        .method("PUT")
+        .uri("/secrets/mykey")
+        .header("x-api-key", "test-api-key-write")
+        .header("x-project-key", "test_project")
+        .header("content-type", "application/json")
+        .body(Body::from(payload))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+  assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+  // Confirm via GET
+  let res = app
+    .clone()
+    .oneshot(
+      Request::builder()
+        .uri("/secrets/mykey")
+        .header("x-api-key", "test-api-key-read")
+        .header("x-project-key", "test_project")
+        .body(Body::empty())
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+  assert_eq!(res.status(), StatusCode::OK);
+  let body = to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
+  let json: Value = serde_json::from_slice(&body).unwrap();
+  assert_eq!(json, serde_json::json!({"new":"data"}));
+}
+
+#[tokio::test]
+async fn test_delete_secret_happy_path() {
+  let (app, _state) = create_test_app().await;
+  // Delete existing secret
+  let res = app
+    .clone()
+    .oneshot(
+      Request::builder()
+        .method("DELETE")
+        .uri("/secrets/mykey")
+        .header("x-api-key", "test-api-key-write")
+        .header("x-project-key", "test_project")
+        .body(Body::empty())
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+  assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+  // Confirm deletion via GET
+  let res = app
+    .clone()
+    .oneshot(
+      Request::builder()
+        .uri("/secrets/mykey")
+        .header("x-api-key", "test-api-key-read")
+        .header("x-project-key", "test_project")
+        .body(Body::empty())
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+  assert_eq!(res.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_search_secrets_without_query_returns_all() {
+  let (app, _state) = create_test_app().await;
+  // Insert an extra secret via upsert
+  let payload = r#"{"key":"another","value":{"a":1}}"#;
+  app
+    .clone()
+    .oneshot(
+      Request::builder()
+        .method("POST")
+        .uri("/secrets")
+        .header("x-api-key", "test-api-key-write")
+        .header("x-project-key", "test_project")
+        .header("content-type", "application/json")
+        .body(Body::from(payload))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+
+  let res = app
+    .clone()
+    .oneshot(
+      Request::builder()
+        .method("POST")
+        .uri("/search")
+        .header("x-api-key", "test-api-key-read")
+        .header("x-project-key", "test_project")
+        .header("content-type", "application/json")
+        .body(Body::from("{}"))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+  assert_eq!(res.status(), StatusCode::OK);
+  let body = to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
+  let arr: Vec<Value> = serde_json::from_slice(&body).unwrap();
+  // Should contain at least two entries
+  assert!(arr.len() >= 2);
+}
+
+#[tokio::test]
+async fn test_search_secrets_with_query_filters() {
+  let (app, _state) = create_test_app().await;
+  let res = app
+    .oneshot(
+      Request::builder()
+        .method("POST")
+        .uri("/search")
+        .header("x-api-key", "test-api-key-read")
+        .header("x-project-key", "test_project")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"query":"myk"}"#))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+  assert_eq!(res.status(), StatusCode::OK);
+  let body = to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
+  let arr: Vec<Value> = serde_json::from_slice(&body).unwrap();
+  // Should only return keys matching 'myk'
+  assert!(
+    arr
+      .iter()
+      .all(|v| v["secret_key"].as_str().unwrap().contains("myk"))
+  );
+}
+
+#[tokio::test]
+async fn test_search_excludes_nonmatching() {
+  let (app, _) = create_test_app().await;
+
+  // Insert a non-matching secret
+  let payload = r#"{"key":"otherkey","value":{"foo":"bar"}}"#;
+  let res = app
+    .clone()
+    .oneshot(
+      Request::builder()
+        .method("POST")
+        .uri("/secrets")
+        .header("x-api-key", "test-api-key-write")
+        .header("x-project-key", "test_project")
+        .header("content-type", "application/json")
+        .body(Body::from(payload))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+  assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+  // Now search for "mykey" only
+  let res = app
+    .clone()
+    .oneshot(
+      Request::builder()
+        .method("POST")
+        .uri("/search")
+        .header("x-api-key", "test-api-key-read")
+        .header("x-project-key", "test_project")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"query":"mykey"}"#))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+  assert_eq!(res.status(), StatusCode::OK);
+
+  // Parse and verify results
+  let body = to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
+  let arr: Vec<Value> = serde_json::from_slice(&body).unwrap();
+  assert_eq!(arr.len(), 1, "Expected exactly one match");
+  assert_eq!(arr[0]["secret_key"].as_str().unwrap(), "mykey");
+}
+
+#[tokio::test]
+async fn test_search_ignores_body_project_key_override() {
+  let (app, _state) = create_test_app().await;
+
+  // 1) Seed a secret under a *different* project via the API
+  let payload = r#"{"key":"othersecret","value":{"x":1}}"#;
+  let res = app
+    .clone()
+    .oneshot(
+      Request::builder()
+        .method("POST")
+        .uri("/secrets")
+        .header("x-api-key", "test-api-key-write")
+        .header("x-project-key", "other_project")
+        .header("content-type", "application/json")
+        .body(Body::from(payload))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+  assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+  // 2) Now search for "othersecret" but with header project = “test_project”
+  //    and an overridden project_key in the JSON body.
+  let body = r#"{
+    "query":"othersecret",
+    "project_key":"other_project"
+  }"#;
+  let res = app
+    .clone()
+    .oneshot(
+      Request::builder()
+        .method("POST")
+        .uri("/search")
+        .header("x-api-key", "test-api-key-read")
+        .header("x-project-key", "test_project")
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+  assert_eq!(res.status(), StatusCode::OK);
+
+  // 3) We should get back an empty array, because "othersecret" lives under
+  //    other_project, not test_project—our header binding wins.
+  let bytes = to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
+  let arr: Vec<Value> = serde_json::from_slice(&bytes).unwrap();
+  assert!(arr.is_empty(), "Expected no results, got {:?}", arr);
 }

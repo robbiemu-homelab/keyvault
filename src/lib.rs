@@ -3,11 +3,17 @@ use axum::{
   http::{StatusCode, request::Parts},
   response::IntoResponse,
 };
+use lucene_parser::make_tantivy_index;
 use serde::Deserialize;
 use sqlx::PgPool;
 use std::collections::HashMap;
+use tantivy::query::QueryParser;
+
+mod lucene_parser;
+use crate::lucene_parser::query_to_sql;
 
 
+// Load SQL queries from queries.yaml
 #[derive(Debug, Deserialize, Clone)]
 pub struct Queries(pub HashMap<String, String>);
 
@@ -21,6 +27,7 @@ impl Queries {
   }
 }
 
+// Shared application state
 #[derive(Clone)]
 pub struct AppState {
   pub read_pool: PgPool,
@@ -28,27 +35,35 @@ pub struct AppState {
   pub queries: Queries,
 }
 
+// Request payloads
 #[derive(Deserialize)]
 pub struct SecretInput {
   pub key: String,
   pub value: serde_json::Value,
 }
 
-/// Extract the `X-PROJECT-KEY` header
-pub struct ProjectKey(String);
+#[derive(Deserialize)]
+pub struct SecretValueOnly {
+  pub value: serde_json::Value,
+}
 
+#[derive(Deserialize)]
+pub struct SearchInput {
+  pub query: Option<String>,
+}
 
-// Simple header-check middleware
+// Extracted headers and auth types
+pub struct ProjectKey(pub String);
 pub struct ReadAuth;
 pub struct WriteAuth;
 
+// Implement Axum extractors for authentication and project scoping
 impl<S> FromRequestParts<S> for ReadAuth
 where
   S: Send + Sync + 'static,
 {
   type Rejection = (StatusCode, &'static str);
 
-  // native async-fn-in-trait—no macro
   async fn from_request_parts(
     parts: &mut Parts,
     _: &S,
@@ -71,7 +86,6 @@ where
 {
   type Rejection = (StatusCode, &'static str);
 
-  // native async-fn-in-trait—no macro
   async fn from_request_parts(
     parts: &mut Parts,
     _: &S,
@@ -99,7 +113,6 @@ where
     parts: &mut Parts,
     _: &S,
   ) -> Result<Self, Self::Rejection> {
-    // read X-PROJECT-KEY header
     let key = parts
       .headers
       .get("x-project-key")
@@ -116,23 +129,22 @@ pub async fn get_secret(
   Path(key): Path<String>,
   Extension(state): Extension<AppState>,
 ) -> impl IntoResponse {
-  let query = match state.queries.get("get_secret") {
+  let sql = match state.queries.get("get_secret") {
     Ok(q) => q,
-    Err(e) => {
+    Err(err) => {
       return (
         StatusCode::INTERNAL_SERVER_ERROR,
-        format!("Query error: {}", e),
+        format!("Query error: {}", err),
       )
         .into_response();
     }
   };
 
-  let rec: Result<Option<(serde_json::Value,)>, _> =
-    sqlx::query_as::<_, (serde_json::Value,)>(query)
-      .bind(&key)
-      .bind(&project)
-      .fetch_optional(&state.read_pool)
-      .await;
+  let rec: Result<Option<(serde_json::Value,)>, _> = sqlx::query_as(sql)
+    .bind(&key)
+    .bind(&project)
+    .fetch_optional(&state.read_pool)
+    .await;
 
   match rec {
     Ok(Some((value,))) => (StatusCode::OK, Json(value)).into_response(),
@@ -149,35 +161,164 @@ pub async fn upsert_secret(
   Extension(state): Extension<AppState>,
   Json(payload): Json<SecretInput>,
 ) -> impl IntoResponse {
-  let query = match state.queries.get("upsert_secret") {
+  let sql = match state.queries.get("upsert_secret") {
     Ok(q) => q,
-    Err(e) => {
+    Err(err) => {
       return (
         StatusCode::INTERNAL_SERVER_ERROR,
-        format!("Query error: {}", e),
+        format!("Query error: {}", err),
       )
         .into_response();
     }
   };
 
-  let result = sqlx::query(query)
-    .bind(&project) // $1 → project_key
-    .bind(&payload.key) // $2 → secret_key
-    .bind(&payload.value) // $3 → secret_value
+  let result = sqlx::query(sql)
+    .bind(&project)
+    .bind(&payload.key)
+    .bind(&payload.value)
     .execute(&state.write_pool)
     .await;
-
 
   match result {
     Ok(_) => StatusCode::NO_CONTENT.into_response(),
     Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "DB error").into_response(),
   }
-  // match result {
-  //   Ok(_) => StatusCode::NO_CONTENT.into_response(),
-  //   Err(err) => {
-  //     // print the full SQLx error to stderr
-  //     eprintln!("[upsert_secret] SQLx error = {:?}", err);
-  //     (StatusCode::INTERNAL_SERVER_ERROR, "DB error").into_response()
-  //   }
-  // }
+}
+
+// PUT /secrets/:key
+pub async fn upsert_secret_by_path(
+  _auth: WriteAuth,
+  ProjectKey(project): ProjectKey,
+  Path(key): Path<String>,
+  Extension(state): Extension<AppState>,
+  Json(payload): Json<SecretValueOnly>,
+) -> impl IntoResponse {
+  let sql = match state.queries.get("upsert_secret") {
+    Ok(q) => q,
+    Err(err) => {
+      return (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("Query error: {}", err),
+      )
+        .into_response();
+    }
+  };
+
+  let result = sqlx::query(sql)
+    .bind(&project)
+    .bind(&key)
+    .bind(&payload.value)
+    .execute(&state.write_pool)
+    .await;
+
+  match result {
+    Ok(_) => StatusCode::NO_CONTENT.into_response(),
+    Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "DB error").into_response(),
+  }
+}
+
+// DELETE /secrets/:key
+pub async fn delete_secret(
+  _auth: WriteAuth,
+  ProjectKey(project): ProjectKey,
+  Path(key): Path<String>,
+  Extension(state): Extension<AppState>,
+) -> impl IntoResponse {
+  let sql = match state.queries.get("delete_secret") {
+    Ok(q) => q,
+    Err(err) => {
+      return (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("Query error: {}", err),
+      )
+        .into_response();
+    }
+  };
+
+  let result = sqlx::query(sql)
+    .bind(&key)
+    .bind(&project)
+    .execute(&state.write_pool)
+    .await;
+
+  match result {
+    Ok(_) => StatusCode::NO_CONTENT.into_response(),
+    Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "DB error").into_response(),
+  }
+}
+
+// POST /search
+pub async fn search_secrets(
+  _auth: ReadAuth,
+  ProjectKey(project): ProjectKey,
+  Extension(state): Extension<AppState>,
+  Json(payload): Json<SearchInput>,
+) -> impl IntoResponse {
+  // 1) Setup index + parser
+  let raw = payload.query.clone().unwrap_or_default();
+  let (index, sk_field, sv_field) = match make_tantivy_index() {
+    Ok(res) => res,
+    Err(e) => {
+      return (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("Index error: {}", e),
+      )
+        .into_response();
+    }
+  };
+  let parser = QueryParser::for_index(&index, vec![sk_field, sv_field]);
+
+  // 2) Parse Lucene‐style syntax
+  let tantivy_query = match parser.parse_query(&raw) {
+    Ok(q) => q,
+    Err(e) => {
+      return (StatusCode::BAD_REQUEST, format!("Query parse error: {}", e))
+        .into_response();
+    }
+  };
+
+  tracing::debug!("🔍 AST = {:#?}", tantivy_query);
+
+  // 3) AST → SQL WHERE clause
+  let where_clause =
+    query_to_sql(tantivy_query.as_ref(), sk_field, sv_field, raw.as_str());
+
+  // 4) Execute dynamic SQL safely
+  let sql = format!(
+    "SELECT secret_key, project_key, secret_value FROM secrets WHERE \
+     project_key = $1 AND ({})",
+    where_clause
+  );
+
+  tracing::debug!("🔍 raw query = {:?}", raw);
+  tracing::debug!("🔍 generated WHERE clause = {}", where_clause);
+
+  let rows =
+    match sqlx::query_as::<_, (String, String, serde_json::Value)>(&sql)
+      .bind(&project)
+      .fetch_all(&state.read_pool)
+      .await
+    {
+      Ok(r) => r,
+      Err(e) => {
+        return (
+          StatusCode::INTERNAL_SERVER_ERROR,
+          format!("DB error: {}", e),
+        )
+          .into_response();
+      }
+    };
+
+  // 5) Return JSON
+  let secrets = rows
+    .into_iter()
+    .map(|(k, p, v)| {
+      serde_json::json!({
+          "secret_key": k,
+          "project_key": p,
+          "secret_value": v,
+      })
+    })
+    .collect::<Vec<_>>();
+  (StatusCode::OK, Json(secrets)).into_response()
 }

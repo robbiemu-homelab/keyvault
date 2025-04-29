@@ -1,4 +1,4 @@
-FROM rust:1.86.0-slim AS builder
+FROM rust:1.86.0-bookworm AS builder
 
 # Install build dependencies first!
 RUN apt-get update && apt-get install -y libssl-dev pkg-config ca-certificates
@@ -13,10 +13,15 @@ COPY . ./
 RUN cargo build --release
 
 # --- Final runtime image ---
-FROM debian:bullseye-slim
+FROM debian:bookworm-slim
 
-RUN apt-get update && apt-get install -y ca-certificates
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY --from=builder /app/target/release/keyvault ./
-CMD ["./keyvault-api"]
+COPY queries.yaml ./
+
+CMD ["./keyvault"]

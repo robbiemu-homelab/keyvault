@@ -1,17 +1,34 @@
 use axum::{
   Router,
   extract::Extension,
+  http::Method,
+  response::IntoResponse,
   routing::{get, post},
 };
 use dotenvy::dotenv;
+use hyper::{HeaderMap, StatusCode};
 use sqlx::postgres::PgPoolOptions;
 use std::{env, net::SocketAddr};
+use tower_http::cors::{Any, CorsLayer};
+use tracing_subscriber::FmtSubscriber;
+use tracing_subscriber::filter::EnvFilter;
 
-use keyvault::{AppState, Queries, get_secret, upsert_secret};
+use keyvault::{
+  AppState, Queries, delete_secret, get_secret, search_secrets, upsert_secret,
+  upsert_secret_by_path,
+};
 
 
 #[tokio::main]
 async fn main() {
+  // initialize subscriber to read RUST_LOG
+  let filter = EnvFilter::try_from_default_env()
+    .unwrap_or_else(|_| EnvFilter::new("warn"));
+  let subscriber = FmtSubscriber::builder().with_env_filter(filter).finish();
+
+  tracing::subscriber::set_global_default(subscriber)
+    .expect("setting default subscriber failed");
+
   let queries: Queries = {
     let data = tokio::fs::read_to_string("queries.yaml")
       .await
@@ -43,9 +60,26 @@ async fn main() {
 
   let state = AppState { read_pool, write_pool, queries };
 
+  let cors = CorsLayer::new()
+    .allow_origin(Any) // Permite qualquer origem. Para maior segurança, especifique a origem do seu frontend.
+    .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
+    .allow_headers(Any);
+
+  async fn cors_preflight() -> impl IntoResponse {
+    (StatusCode::NO_CONTENT, HeaderMap::new())
+  }
+
   let app = Router::new()
-    .route("/secrets/{key}", get(get_secret))
-    .route("/secrets", post(upsert_secret))
+    .route(
+      "/secrets/{key}",
+      get(get_secret)
+        .put(upsert_secret_by_path)
+        .delete(delete_secret)
+        .options(cors_preflight),
+    )
+    .route("/secrets", post(upsert_secret).options(cors_preflight))
+    .route("/search", post(search_secrets).options(cors_preflight))
+    .layer(cors)
     .layer(Extension(state));
 
   let addr = SocketAddr::from(([0, 0, 0, 0], 3000));

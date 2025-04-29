@@ -2,8 +2,9 @@ services:
   keyvault-api:
     build: .
     ports:
-      - "3000:3000"
+      - "4444:3000"
     environment:
+      RUST_LOG: "debug,sqlx=debug"
       # Postgres connection (Postgres service is on the same 'backend' network)
       PG_HOST:              postgres
       POSTGRES_DB:          ${POSTGRES_DB}
@@ -17,17 +18,10 @@ services:
     networks:
       - homelab
 
-  logicapp:
-    image: nodered/node-red:latest
-    container_name: keyvault-logicapp
+  keyvault-ui:
+    build: ./keyvault-ui
     ports:
-      - "1880:1880"
-    volumes:
-      - node_red_data:/data
-    environment:
-      # secure the editor/UI with admin credentials
-      - NODE_RED_USERNAME=${NODE_RED_USERNAME}
-      - NODE_RED_PASSWORD=${NODE_RED_PASSWORD}
+      - "4000:3000" 
     networks:
       - homelab
 
