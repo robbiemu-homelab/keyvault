@@ -168,16 +168,16 @@ pub async fn upsert_secret(
     .await;
 
 
-  // match result {
-  //   Ok(_) => StatusCode::NO_CONTENT.into_response(),
-  //   Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "DB error").into_response(),
-  // }
   match result {
     Ok(_) => StatusCode::NO_CONTENT.into_response(),
-    Err(err) => {
-      // print the full SQLx error to stderr
-      eprintln!("[upsert_secret] SQLx error = {:?}", err);
-      (StatusCode::INTERNAL_SERVER_ERROR, "DB error").into_response()
-    }
+    Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "DB error").into_response(),
   }
+  // match result {
+  //   Ok(_) => StatusCode::NO_CONTENT.into_response(),
+  //   Err(err) => {
+  //     // print the full SQLx error to stderr
+  //     eprintln!("[upsert_secret] SQLx error = {:?}", err);
+  //     (StatusCode::INTERNAL_SERVER_ERROR, "DB error").into_response()
+  //   }
+  // }
 }
