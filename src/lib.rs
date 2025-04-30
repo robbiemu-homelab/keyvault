@@ -3,13 +3,13 @@ use axum::{
   http::{StatusCode, request::Parts},
   response::IntoResponse,
 };
-use lucene_parser::make_tantivy_index;
+use lucene_parser::{extract_key_values, make_tantivy_index};
 use serde::Deserialize;
 use sqlx::PgPool;
 use std::collections::HashMap;
-use tantivy::query::QueryParser;
+use tantivy::query::{AllQuery, QueryParser};
 
-mod lucene_parser;
+pub mod lucene_parser;
 use crate::lucene_parser::query_to_sql;
 
 
@@ -268,21 +268,28 @@ pub async fn search_secrets(
   };
   let parser = QueryParser::for_index(&index, vec![sk_field, sv_field]);
 
-  // 2) Parse Lucene‐style syntax
-  let tantivy_query = match parser.parse_query(&raw) {
-    Ok(q) => q,
-    Err(e) => {
-      return (StatusCode::BAD_REQUEST, format!("Query parse error: {}", e))
-        .into_response();
-    }
+  // 2) If it’s _only_ JSON key:value pairs, bypass the Tantivy parser entirely.
+  //    (So we never error out on “unknown field”.)
+  let where_clause = if !extract_key_values(&raw).is_empty()
+    && raw.split_whitespace().all(|tok| tok.contains(':'))
+  {
+    // call your multi-pair (or single-pair) logic directly
+    query_to_sql(&AllQuery, sk_field, sv_field, &raw)
+    // …then jump straight to executing that SQL below…
+  } else {
+    // Otherwise parse with Tantivy as before
+    let tantivy_query = match parser.parse_query(&raw) {
+      Ok(q) => q,
+      Err(e) => {
+        tracing::debug!("🔍 BAD_REQUEST, error: '{}', request: {}", raw, e);
+        return (StatusCode::BAD_REQUEST, format!("Query parse error: {}", e))
+          .into_response();
+      }
+    };
+    tracing::debug!("🔍 AST = {:#?}", tantivy_query);
+    query_to_sql(tantivy_query.as_ref(), sk_field, sv_field, &raw)
+    // …and continue down to your SQL execution…
   };
-
-  tracing::debug!("🔍 AST = {:#?}", tantivy_query);
-
-  // 3) AST → SQL WHERE clause
-  let where_clause =
-    query_to_sql(tantivy_query.as_ref(), sk_field, sv_field, raw.as_str());
-
   // 4) Execute dynamic SQL safely
   let sql = format!(
     "SELECT secret_key, project_key, secret_value FROM secrets WHERE \

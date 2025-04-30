@@ -16,7 +16,7 @@ export function ProjectPage({ projectKey }: ProjectPageProps) {
       </header>
 
       <main className="flex-1 p-6">
-        <SearchPage projectKey={projectKey} />
+        <SearchPage initialProjectKey={projectKey} />
       </main>
 
       <footer className="text-center p-4 text-xs text-gray-500">
