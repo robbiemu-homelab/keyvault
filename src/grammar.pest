@@ -1,0 +1,53 @@
+// =========  silent whitespace =========
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" }  // Note the underscore making it silent
+
+// =========  atoms =========
+ESC            = ${ "\\" ~ ANY }
+QUOTED_INNER   = _{ 
+    ESC 
+  | (!("\"" | "\\") ~ ANY) 
+}
+quoted_string  = @{ "\"" ~ QUOTED_INNER* ~ "\"" }
+ident          = @{ 
+  !("AND" | "OR") 
+  ~ (ASCII_ALPHANUMERIC | "_" | "-" | ".")+ 
+}
+
+// =========  key:value =========
+key            = { quoted_string | ident }
+value          = { quoted_string | ident }
+key_value      = { key ~ ":" ~ value }  // No explicit whitespace needed
+
+// =========  entry =========
+expression     = { or_expr ~ EOI }  // No explicit whitespace needed
+
+// =========  precedence (NOT > AND > OR) =========
+or_expr        = { 
+  and_expr 
+  ~ ( or_op ~ and_expr )* 
+}
+
+// AND has the same precedence whether written as "AND" or just a blank space
+and_expr = {
+  not_expr
+  ~ (
+      ( and_op ~ not_expr )   // a AND b
+    | ( &not_expr ~ not_expr )  // a b (with lookahead to ensure it's a not_expr)
+    )*
+}
+
+// NOT has the highest precedence
+not_expr       = { 
+  NOT_OP? ~ primary 
+}
+
+// =========  primaries =========
+primary        = { grouped | key_value | phrase | term }
+grouped        = { "(" ~ or_expr ~ ")" }  // No explicit whitespace needed
+phrase         = { quoted_string }
+term           = { ident }
+
+// =========  operators =========
+and_op         = { "AND" }
+or_op          = { "OR" }
+NOT_OP         = { "-" }

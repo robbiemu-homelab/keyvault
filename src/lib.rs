@@ -3,11 +3,9 @@ use axum::{
   http::{StatusCode, request::Parts},
   response::IntoResponse,
 };
-use lucene_parser::{extract_key_values, make_tantivy_index};
 use serde::Deserialize;
 use sqlx::PgPool;
 use std::collections::HashMap;
-use tantivy::query::{AllQuery, QueryParser};
 
 pub mod lucene_parser;
 use crate::lucene_parser::query_to_sql;
@@ -254,78 +252,67 @@ pub async fn search_secrets(
   Extension(state): Extension<AppState>,
   Json(payload): Json<SearchInput>,
 ) -> impl IntoResponse {
-  // 1) Setup index + parser
-  let raw = payload.query.clone().unwrap_or_default();
-  let (index, sk_field, sv_field) = match make_tantivy_index() {
-    Ok(res) => res,
-    Err(e) => {
+  // Return Response directly to handle errors
+  let raw_query = payload.query.unwrap_or_default();
+
+  // 1) Attempt to parse the raw query into a SQL WHERE clause
+  let where_clause = match query_to_sql(&raw_query) {
+    Ok(clause) => clause,
+    Err(parse_err) => {
+      tracing::warn!(
+        "Query parsing failed: {:?} for query: '{}'",
+        parse_err,
+        raw_query
+      );
+      // Return 400 Bad Request on parse error
       return (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        format!("Index error: {}", e),
+        StatusCode::BAD_REQUEST,
+        // Provide a user-friendly error message from the Display impl
+        format!("Invalid search query syntax. Error details: {}", parse_err),
       )
         .into_response();
     }
   };
-  let parser = QueryParser::for_index(&index, vec![sk_field, sv_field]);
 
-  // 2) If it’s _only_ JSON key:value pairs, bypass the Tantivy parser entirely.
-  //    (So we never error out on “unknown field”.)
-  let where_clause = if !extract_key_values(&raw).is_empty()
-    && raw.split_whitespace().all(|tok| tok.contains(':'))
-  {
-    // call your multi-pair (or single-pair) logic directly
-    query_to_sql(&AllQuery, sk_field, sv_field, &raw)
-    // …then jump straight to executing that SQL below…
-  } else {
-    // Otherwise parse with Tantivy as before
-    let tantivy_query = match parser.parse_query(&raw) {
-      Ok(q) => q,
-      Err(e) => {
-        tracing::debug!("🔍 BAD_REQUEST, error: '{}', request: {}", raw, e);
-        return (StatusCode::BAD_REQUEST, format!("Query parse error: {}", e))
-          .into_response();
-      }
-    };
-    tracing::debug!("🔍 AST = {:#?}", tantivy_query);
-    query_to_sql(tantivy_query.as_ref(), sk_field, sv_field, &raw)
-    // …and continue down to your SQL execution…
-  };
-  // 4) Execute dynamic SQL safely
+  // 2) Build the final SQL query safely
   let sql = format!(
     "SELECT secret_key, project_key, secret_value FROM secrets WHERE \
      project_key = $1 AND ({})",
-    where_clause
+    where_clause // Inject the parsed and validated WHERE clause
   );
 
-  tracing::debug!("🔍 raw query = {:?}", raw);
-  tracing::debug!("🔍 generated WHERE clause = {}", where_clause);
+  tracing::debug!("🔍 Raw query = {:?}", raw_query);
+  tracing::debug!("🔍 Generated SQL = {}", sql); // Log the full SQL for debugging
 
-  let rows =
-    match sqlx::query_as::<_, (String, String, serde_json::Value)>(&sql)
-      .bind(&project)
-      .fetch_all(&state.read_pool)
-      .await
-    {
-      Ok(r) => r,
-      Err(e) => {
-        return (
-          StatusCode::INTERNAL_SERVER_ERROR,
-          format!("DB error: {}", e),
-        )
-          .into_response();
-      }
-    };
+  // 3) Execute the query
+  let result = sqlx::query_as::<_, (String, String, serde_json::Value)>(&sql)
+    .bind(&project)
+    .fetch_all(&state.read_pool)
+    .await;
 
-  // 5) Return JSON
-  let secrets = rows
-    .into_iter()
-    .map(|(k, p, v)| {
-      serde_json::json!({
-          "secret_key": k,
-          "project_key": p,
-          "secret_value": v,
-      })
-    })
-    .collect::<Vec<_>>();
-  (StatusCode::OK, Json(secrets)).into_response()
+  match result {
+    Ok(rows) => {
+      // 4) Format and return results as JSON
+      let secrets = rows
+        .into_iter()
+        .map(|(k, p, v)| {
+          serde_json::json!({
+              "secret_key": k,
+              "project_key": p,
+              "secret_value": v,
+          })
+        })
+        .collect::<Vec<_>>();
+      (StatusCode::OK, Json(secrets)).into_response()
+    }
+    Err(db_err) => {
+      tracing::error!("Database error during search: {}", db_err);
+      // Handle potential DB errors (e.g., invalid SQL generated, connection issues)
+      (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Database error executing search".to_string(), // Keep DB details internal
+      )
+        .into_response()
+    }
+  }
 }
